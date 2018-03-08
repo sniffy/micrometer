@@ -15,194 +15,78 @@
  */
 package io.micrometer.influx;
 
+import com.google.common.annotations.VisibleForTesting;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.config.NamingConvention;
 import io.micrometer.core.instrument.distribution.HistogramSnapshot;
 import io.micrometer.core.instrument.step.StepMeterRegistry;
 import io.micrometer.core.instrument.util.DoubleFormat;
-import io.micrometer.core.instrument.util.MeterPartition;
-import io.micrometer.core.lang.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import rx.Observable;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.*;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
-import java.util.zip.GZIPOutputStream;
 
 import static java.util.stream.Collectors.joining;
-import static java.util.stream.Collectors.toList;
 
 /**
  * @author Jon Schneider
  */
 public class InfluxMeterRegistry extends StepMeterRegistry {
     private final InfluxConfig config;
+    private final InfluxTransport influxTransport;
     private final Logger logger = LoggerFactory.getLogger(InfluxMeterRegistry.class);
-    private boolean databaseExists = false;
 
-    public InfluxMeterRegistry(InfluxConfig config, Clock clock, ThreadFactory threadFactory) {
+    public InfluxMeterRegistry(InfluxConfig config, InfluxTransport influxTransport, Clock clock, ThreadFactory threadFactory) {
         super(config, clock);
+        this.influxTransport = influxTransport;
         this.config().namingConvention(new InfluxNamingConvention(NamingConvention.snakeCase));
         this.config = config;
         start(threadFactory);
+    }
+
+    public InfluxMeterRegistry(InfluxConfig config, Clock clock, ThreadFactory threadFactory) {
+        this(config, InfluxTransport.create(config), clock, threadFactory);
     }
 
     public InfluxMeterRegistry(InfluxConfig config, Clock clock) {
         this(config, clock, Executors.defaultThreadFactory());
     }
 
-    private void createDatabaseIfNecessary() {
-        if (!config.autoCreateDb() || databaseExists)
-            return;
-
-        HttpURLConnection con = null;
-        try {
-            URL queryEndpoint = URI.create(config.uri() + "/query?q=" + URLEncoder.encode("CREATE DATABASE \"" + config.db() + "\"", "UTF-8")).toURL();
-
-            con = (HttpURLConnection) queryEndpoint.openConnection();
-            con.setConnectTimeout((int) config.connectTimeout().toMillis());
-            con.setReadTimeout((int) config.readTimeout().toMillis());
-            con.setRequestMethod("POST");
-            authenticateRequest(con);
-
-            int status = con.getResponseCode();
-
-            if (status >= 200 && status < 300) {
-                logger.debug("influx database {} is ready to receive metrics", config.db());
-                databaseExists = true;
-            } else if (status >= 400) {
-                try (InputStream in = con.getErrorStream()) {
-                    logger.error("unable to create database '{}': {}", config.db(), new BufferedReader(new InputStreamReader(in))
-                            .lines().collect(joining("\n")));
-                }
-            }
-        } catch (Throwable e) {
-            logger.error("unable to create database '{}'", config.db(), e);
-        } finally {
-            quietlyCloseUrlConnection(con);
-        }
-    }
-
     @Override
     protected void publish() {
-        createDatabaseIfNecessary();
 
-        try {
-            String write = "/write?consistency=" + config.consistency().toString().toLowerCase() + "&precision=ms&db=" + config.db();
-            if (!isBlank(config.retentionPolicy())) {
-                write += "&rp=" + config.retentionPolicy();
+        influxTransport.sendData(Observable.from(getMeters()).map(m -> {
+            if (m instanceof Timer) {
+                return writeTimer((Timer) m);
             }
-            URL influxEndpoint = URI.create(config.uri() + write).toURL();
-            HttpURLConnection con = null;
-
-            for (List<Meter> batch : MeterPartition.partition(this, config.batchSize())) {
-                try {
-                    con = (HttpURLConnection) influxEndpoint.openConnection();
-                    con.setConnectTimeout((int) config.connectTimeout().toMillis());
-                    con.setReadTimeout((int) config.readTimeout().toMillis());
-                    con.setRequestMethod("POST");
-                    con.setRequestProperty("Content-Type", "plain/text");
-                    con.setDoOutput(true);
-
-                    authenticateRequest(con);
-
-                    List<String> bodyLines = batch.stream()
-                            .map(m -> {
-                                if (m instanceof Timer) {
-                                    return writeTimer((Timer) m);
-                                }
-                                if (m instanceof DistributionSummary) {
-                                    return writeSummary((DistributionSummary) m);
-                                }
-                                if (m instanceof FunctionTimer) {
-                                    return writeTimer((FunctionTimer) m);
-                                }
-                                if (m instanceof TimeGauge) {
-                                    return writeGauge(m.getId(), ((TimeGauge) m).value(getBaseTimeUnit()));
-                                }
-                                if (m instanceof Gauge) {
-                                    return writeGauge(m.getId(), ((Gauge) m).value());
-                                }
-                                if (m instanceof FunctionCounter) {
-                                    return writeCounter(m.getId(), ((FunctionCounter) m).count());
-                                }
-                                if (m instanceof Counter) {
-                                    return writeCounter(m.getId(), ((Counter) m).count());
-                                }
-                                if (m instanceof LongTaskTimer) {
-                                    return writeLongTaskTimer((LongTaskTimer) m);
-                                }
-                                return writeMeter(m);
-                            })
-                            .collect(toList());
-
-                    String body = String.join("\n", bodyLines);
-
-                    if (config.compressed())
-                        con.setRequestProperty("Content-Encoding", "gzip");
-
-                    try (OutputStream os = con.getOutputStream()) {
-                        if (config.compressed()) {
-                            try (GZIPOutputStream gz = new GZIPOutputStream(os)) {
-                                gz.write(body.getBytes());
-                                gz.flush();
-                            }
-                        } else {
-                            os.write(body.getBytes());
-                        }
-                        os.flush();
-                    }
-
-                    int status = con.getResponseCode();
-
-                    if (status >= 200 && status < 300) {
-                        logger.info("successfully sent {} metrics to influx", batch.size());
-                        databaseExists = true;
-                    } else if (status >= 400) {
-                        try (InputStream in = con.getErrorStream()) {
-                            logger.error("failed to send metrics: " + new BufferedReader(new InputStreamReader(in))
-                                    .lines().collect(joining("\n")));
-                        }
-                    } else {
-                        logger.error("failed to send metrics: http " + status);
-                    }
-
-                } finally {
-                    quietlyCloseUrlConnection(con);
-                }
+            if (m instanceof DistributionSummary) {
+                return writeSummary((DistributionSummary) m);
             }
-        } catch (MalformedURLException e) {
-            throw new IllegalArgumentException("Malformed InfluxDB publishing endpoint, see '" + config.prefix() + ".uri'", e);
-        } catch (Throwable e) {
-            logger.error("failed to send metrics", e);
-        }
-    }
-
-    private void authenticateRequest(HttpURLConnection con) {
-        if (config.userName() != null && config.password() != null) {
-            String encoded = Base64.getEncoder().encodeToString((config.userName() + ":" +
-                    config.password()).getBytes(StandardCharsets.UTF_8));
-            con.setRequestProperty("Authorization", "Basic " + encoded);
-        }
-    }
-
-    private void quietlyCloseUrlConnection(@Nullable HttpURLConnection con) {
-        try {
-            if (con != null) {
-                con.disconnect();
+            if (m instanceof FunctionTimer) {
+                return writeTimer((FunctionTimer) m);
             }
-        } catch (Exception ignore) {
-        }
+            if (m instanceof TimeGauge) {
+                return writeGauge(m.getId(), ((TimeGauge) m).value(getBaseTimeUnit()));
+            }
+            if (m instanceof Gauge) {
+                return writeGauge(m.getId(), ((Gauge) m).value());
+            }
+            if (m instanceof FunctionCounter) {
+                return writeCounter(m.getId(), ((FunctionCounter) m).count());
+            }
+            if (m instanceof Counter) {
+                return writeCounter(m.getId(), ((Counter) m).count());
+            }
+            if (m instanceof LongTaskTimer) {
+                return writeLongTaskTimer((LongTaskTimer) m);
+            }
+            return writeMeter(m);
+        }));
+
     }
 
     class Field {
@@ -225,7 +109,7 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
 
         for (Measurement measurement : m.measure()) {
             String fieldKey = measurement.getStatistic().toString()
-                    .replaceAll("(.)(\\p{Upper})", "$1_$2").toLowerCase();
+                .replaceAll("(.)(\\p{Upper})", "$1_$2").toLowerCase();
             fields.add(new Field(fieldKey, measurement.getValue()));
         }
 
@@ -234,8 +118,8 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
 
     private String writeLongTaskTimer(LongTaskTimer timer) {
         Stream<Field> fields = Stream.of(
-                new Field("active_tasks", timer.activeTasks()),
-                new Field("duration", timer.duration(getBaseTimeUnit()))
+            new Field("active_tasks", timer.activeTasks()),
+            new Field("duration", timer.duration(getBaseTimeUnit()))
         );
 
         return influxLineProtocol(timer.getId(), "long_task_timer", fields, clock.wallTime());
@@ -251,9 +135,9 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
 
     private String writeTimer(FunctionTimer timer) {
         Stream<Field> fields = Stream.of(
-                new Field("sum", timer.totalTime(getBaseTimeUnit())),
-                new Field("count", timer.count()),
-                new Field("mean", timer.mean(getBaseTimeUnit()))
+            new Field("sum", timer.totalTime(getBaseTimeUnit())),
+            new Field("count", timer.count()),
+            new Field("mean", timer.mean(getBaseTimeUnit()))
         );
 
         return influxLineProtocol(timer.getId(), "histogram", fields, clock.wallTime());
@@ -285,36 +169,52 @@ public class InfluxMeterRegistry extends StepMeterRegistry {
 
     private String influxLineProtocol(Meter.Id id, String metricType, Stream<Field> fields, long time) {
         String tags = getConventionTags(id).stream()
-                .map(t -> "," + t.getKey() + "=" + t.getValue())
-                .collect(joining(""));
+            .map(t -> "," + t.getKey() + "=" + t.getValue())
+            .collect(joining(""));
 
         return getConventionName(id)
-                + tags + ",metric_type=" + metricType + " "
-                + fields.map(Field::toString).collect(joining(","))
-                + " " + time;
+            + tags + ",metric_type=" + metricType + " "
+            + fields.map(Field::toString).collect(joining(","))
+            + " " + time;
+    }
+
+    /**
+     * For tag keys, tag values, and field keys always use a backslash character \ to escape:
+     * commas, equal signs and spaces
+     * <p>
+     * Backslash (\) is not allowed as a last character and removed in this position
+     *
+     * @param tagKeyOrTagValueOrFieldKey measurement name
+     * @return escaped measurement name
+     */
+    @VisibleForTesting
+    static String escapeTagKeysTagValuesFieldKeys(String tagKeyOrTagValueOrFieldKey) {
+        String escapedValue = tagKeyOrTagValueOrFieldKey.replaceAll("([,=\\s])", "\\$1");
+        return escapedValue.endsWith("\\") ? escapedValue.substring(0, escapedValue.length() - 1) : escapedValue;
+    }
+
+    /**
+     * For measurements always use a backslash character \ to escape:
+     * commas and spaces
+     * <p>
+     * Backslash (\) is not allowed as a last character and removed in this position
+     *
+     * @param measurementName measurement name
+     * @return escaped measurement name
+     */
+    @VisibleForTesting
+    static String escapeMeasurementName(String measurementName) {
+        String escapedValue = measurementName.replaceAll("([,\\s])", "\\$1");
+        return escapedValue.endsWith("\\") ? escapedValue.substring(0, escapedValue.length() - 1) : escapedValue;
+    }
+
+    @VisibleForTesting
+    static String escapeFieldValue(String fieldValue) {
+        return fieldValue.replaceAll("\"", "\\\"").replaceAll("\\n", "\\\\");
     }
 
     @Override
     protected final TimeUnit getBaseTimeUnit() {
         return TimeUnit.MILLISECONDS;
-    }
-
-    /**
-     * Modified from {@link org.apache.commons.lang.StringUtils#isBlank(String)}.
-     *
-     * @param str The string to check
-     * @return {@code true} if the String is null or blank.
-     */
-    private static boolean isBlank(@Nullable String str) {
-        int strLen;
-        if (str == null || (strLen = str.length()) == 0) {
-            return true;
-        }
-        for (int i = 0; i < strLen; i++) {
-            if (!Character.isWhitespace(str.charAt(i))) {
-                return false;
-            }
-        }
-        return true;
     }
 }
